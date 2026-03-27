@@ -1,0 +1,7 @@
+data.json
+node_modules/
+.env
+scanner_state.json
+pending_addlp.json
+old.js
+package-lock.json
