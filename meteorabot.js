@@ -10,7 +10,7 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const MONITOR_INTERVAL = 2500; // 2.5 seconds
 
 const RPC_LIST = [
-  { label: 'Helius', url: 'https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY' },
+  { label: 'Helius', url: 'https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}' },
   { label: 'Solana Public', url: 'https://api.mainnet-beta.solana.com' },
   { label: 'Helius Pump', url: 'https://pump.helius-rpc.com/' },
 ];
@@ -19,8 +19,8 @@ const DEFAULT_PRESETS = {
   sannastrat: { name: 'sannastrat', sol: 0.1, range: 35, strategy: 'spot' },
 };
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+// TELEGRAM_TOKEN loaded after loadEnvFile() below
+
 const DATA_FILE = './data.json';
 
 function loadData() {
@@ -49,6 +49,8 @@ function loadEnvFile() {
   } catch { }
 }
 loadEnvFile();
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
 function saveEnvFile() {
   const lines = Object.entries(process.env)
