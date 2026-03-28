@@ -7,7 +7,7 @@ const fs = require('fs');
 
 const StrategyType = { Spot: 0, Curve: 1, BidAsk: 2 };
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
-const MONITOR_INTERVAL = 2500; // 2.5 seconds
+const MONITOR_INTERVAL = 2500;
 
 const RPC_LIST = [
   { label: 'Helius', url: 'https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY' },
@@ -15,47 +15,59 @@ const RPC_LIST = [
   { label: 'Helius Pump', url: 'https://pump.helius-rpc.com/' },
 ];
 
-const DEFAULT_PRESETS = {
-  sannastrat: { name: 'sannastrat', sol: 0.1, range: 35, strategy: 'spot' },
-};
-
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const DATA_FILE = './data.json';
 
-function loadData() {
-  let data;
-  try { data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
-  catch { data = { wallets: {}, activeWalletId: null, positions: {}, presets: {}, activePresetId: 'sannastrat' }; }
-  if (!data.presets) data.presets = {};
-  if (!data.presets.sannastrat) data.presets.sannastrat = DEFAULT_PRESETS.sannastrat;
-  if (!data.activePresetId) data.activePresetId = 'sannastrat';
-  return data;
-}
-function saveData() { fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2)); }
-const state = loadData();
-
-// Extreme sessions: { chatId: { poolAddress, positionKey, targetBinId, solAmount, status, cycleCount, timer } }
-const extremeSessions = {};
-
-// PK stored in .env as WALLET_1, WALLET_2, etc
 function loadEnvFile() {
   try {
     const envFile = fs.readFileSync('./.env', 'utf8');
     envFile.split('\n').forEach(line => {
-      const [key, ...val] = line.split('=');
-      if (key && val.length) process.env[key.trim()] = val.join('=').trim();
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) return;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx === -1) return;
+      const key = trimmed.slice(0, eqIdx).trim();
+      const val = trimmed.slice(eqIdx + 1).trim();
+      if (key) process.env[key] = val;
     });
   } catch { }
 }
 loadEnvFile();
 
+// Replace Helius RPC URL with actual API key from env
+if (process.env.HELIUS_API_KEY) {
+  RPC_LIST[0].url = `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`;
+}
+
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+
+function loadData() {
+  let data;
+  try { data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
+  catch { data = { wallets: {}, activeWalletId: null, positions: {}, presets: {}, activePresetId: null }; }
+  if (!data.presets) data.presets = {};
+  return data;
+}
+function saveData() { fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2)); }
+const state = loadData();
+
+const extremeSessions = {};
+
 function saveEnvFile() {
-  const lines = Object.entries(process.env)
-    .filter(([k]) => /^WALLET_\d+$/.test(k))
-    .map(([k, v]) => `${k}=${v}`);
-  fs.writeFileSync('./.env', lines.join('\n') + '\n');
-  fs.chmodSync('./.env', 0o600);
+  try {
+    let existing = '';
+    try { existing = fs.readFileSync('./.env', 'utf8'); } catch { }
+    const lines = existing.split('\n').filter(l => {
+      const key = l.split('=')[0].trim();
+      return key && !/^WALLET_\d+$/.test(key);
+    });
+    const walletLines = Object.entries(process.env)
+      .filter(([k]) => /^WALLET_\d+$/.test(k))
+      .map(([k, v]) => `${k}=${v}`);
+    const allLines = [...lines.filter(Boolean), ...walletLines];
+    fs.writeFileSync('./.env', allLines.join('\n') + '\n');
+    fs.chmodSync('./.env', 0o600);
+  } catch (e) { console.error('[Env] saveEnvFile error:', e.message); }
 }
 
 function getNextWalletEnvKey() {
@@ -88,8 +100,10 @@ function switchWallet(id) {
   saveData();
 }
 function getActivePreset() {
-  if (!state.presets) { state.presets = { ...DEFAULT_PRESETS }; state.activePresetId = 'sannastrat'; }
-  return state.presets[state.activePresetId] || state.presets['sannastrat'] || Object.values(state.presets)[0];
+  if (!state.presets) state.presets = {};
+  return (state.activePresetId && state.presets[state.activePresetId])
+    || Object.values(state.presets)[0]
+    || null;
 }
 function addPreset(id, name, sol, range, strategy) {
   if (!state.presets) state.presets = {};
@@ -102,9 +116,8 @@ function switchPreset(id) {
   saveData();
 }
 function deletePreset(id) {
-  if (id === 'sannastrat') throw new Error('Default preset tidak bisa dihapus');
   delete state.presets[id];
-  if (state.activePresetId === id) state.activePresetId = 'sannastrat';
+  if (state.activePresetId === id) state.activePresetId = Object.keys(state.presets)[0] || null;
   saveData();
 }
 
@@ -143,8 +156,6 @@ function isPoolInput(text) {
 function shortKey(key) { return key.slice(0, 6) + '...' + key.slice(-4); }
 function solLabel(sol) { return sol === 'max' ? 'MAX SOL' : `${sol} SOL`; }
 
-// ─── Extreme Mode ─────────────────────────────────────────────
-
 async function getPoolAndActiveBin(poolAddress) {
   const dlmmPool = await DLMM.create(connection, new PublicKey(poolAddress));
   const activeBin = await dlmmPool.getActiveBin();
@@ -154,17 +165,14 @@ async function getPoolAndActiveBin(poolAddress) {
 async function openExtremePosition(poolAddress, solAmount) {
   const wallet = getActiveWallet();
   if (!wallet) throw new Error('Tidak ada wallet aktif');
-
   let finalSol = solAmount;
   if (solAmount === 'max') {
     const bal = await getSolBalance(wallet.publicKey.toBase58());
     finalSol = parseFloat((Math.max(0, bal - 0.08)).toFixed(4));
   }
-
   const { dlmmPool, activeBin } = await getPoolAndActiveBin(poolAddress);
   await dlmmPool.refetchStates();
   const targetBinId = activeBin.binId;
-
   const newPosition = Keypair.generate();
   const createTx = await dlmmPool.initializePositionAndAddLiquidityByStrategy({
     positionPubKey: newPosition.publicKey,
@@ -173,7 +181,6 @@ async function openExtremePosition(poolAddress, solAmount) {
     totalYAmount: solToLamports(finalSol),
     strategy: { minBinId: targetBinId, maxBinId: targetBinId, strategyType: StrategyType.BidAsk },
   });
-
   const txHash = await sendAndConfirmTransaction(connection, createTx, [wallet, newPosition]);
   return { positionKey: newPosition.publicKey.toBase58(), targetBinId, txHash, solUsed: finalSol };
 }
@@ -181,24 +188,17 @@ async function openExtremePosition(poolAddress, solAmount) {
 async function withdrawAndReaddToTargetBin(poolAddress, positionKey, targetBinId) {
   const wallet = getActiveWallet();
   if (!wallet) throw new Error('Tidak ada wallet aktif');
-
   const dlmmPool = await DLMM.create(connection, new PublicKey(poolAddress));
   await dlmmPool.refetchStates();
-
   const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
   const userPos = userPositions.find(p => p.publicKey.toBase58() === positionKey);
   if (!userPos) throw new Error('Position tidak ditemukan');
-
   const binData = userPos.positionData.positionBinData;
   if (!binData || binData.length === 0) return null;
-
-  // Get token info before withdraw
   const tokenXMint = dlmmPool.lbPair.tokenXMint.toBase58();
   const tokenYMint = dlmmPool.lbPair.tokenYMint.toBase58();
   const isTokenX = tokenXMint !== SOL_MINT;
   const tokenMint = isTokenX ? tokenXMint : tokenYMint;
-
-  // Step 1: Withdraw liquidity (keep position open, shouldClaimAndClose: false)
   const binIds = binData.map(b => b.binId);
   const removeTx = await dlmmPool.removeLiquidity({
     position: new PublicKey(positionKey),
@@ -212,16 +212,12 @@ async function withdrawAndReaddToTargetBin(poolAddress, positionKey, targetBinId
   await Promise.all(txList.map(tx =>
     sendAndConfirmTransaction(connection, tx, [wallet], { skipPreflight: true, commitment: 'processed' })
   ));
-
-  // Step 2: Fast retry every 500ms up to 10 seconds
   let tokenBalance = new BN(0);
   const _deadline = Date.now() + 10000;
   while (Date.now() < _deadline) {
     try {
       const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
-        wallet.publicKey,
-        { mint: new PublicKey(tokenMint) },
-        'processed'
+        wallet.publicKey, { mint: new PublicKey(tokenMint) }, 'processed'
       );
       if (tokenAccounts.value.length > 0) {
         const amt = tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount;
@@ -231,13 +227,7 @@ async function withdrawAndReaddToTargetBin(poolAddress, positionKey, targetBinId
     } catch (e) { }
     await new Promise(r => setTimeout(r, 500));
   }
-
-  if (tokenBalance.eqn(0)) {
-    console.log('[Extreme] No token balance after withdraw, skipping readd');
-    return 'no_token';
-  }
-
-  // Step 3: Add token back to SAME target bin
+  if (tokenBalance.eqn(0)) { console.log('[Extreme] No token balance after withdraw, skipping readd'); return 'no_token'; }
   await dlmmPool.refetchStates();
   const addTx = await dlmmPool.addLiquidityByStrategy({
     positionPubKey: new PublicKey(positionKey),
@@ -246,7 +236,6 @@ async function withdrawAndReaddToTargetBin(poolAddress, positionKey, targetBinId
     totalYAmount: isTokenX ? new BN(0) : tokenBalance,
     strategy: { minBinId: targetBinId, maxBinId: targetBinId, strategyType: StrategyType.BidAsk },
   });
-
   const addHash = await sendAndConfirmTransaction(connection, addTx, [wallet], { skipPreflight: true, commitment: 'processed' });
   return addHash;
 }
@@ -254,23 +243,17 @@ async function withdrawAndReaddToTargetBin(poolAddress, positionKey, targetBinId
 async function closeAndReopenPosition(poolAddress, positionKey, solAmount) {
   const wallet = getActiveWallet();
   if (!wallet) throw new Error('Tidak ada wallet aktif');
-
-  // Step 1: Close position with claim
   const dlmmPool = await DLMM.create(connection, new PublicKey(poolAddress));
   await dlmmPool.refetchStates();
   const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
   const userPos = userPositions.find(p => p.publicKey.toBase58() === positionKey);
-
   if (userPos) {
     const binIds = userPos.positionData.positionBinData.map(b => b.binId);
     if (binIds.length > 0) {
       const removeTx = await dlmmPool.removeLiquidity({
-        position: new PublicKey(positionKey),
-        user: wallet.publicKey,
-        fromBinId: binIds[0],
-        toBinId: binIds[binIds.length - 1],
-        bps: new BN(10000),
-        shouldClaimAndClose: true,
+        position: new PublicKey(positionKey), user: wallet.publicKey,
+        fromBinId: binIds[0], toBinId: binIds[binIds.length - 1],
+        bps: new BN(10000), shouldClaimAndClose: true,
       });
       const txList = Array.isArray(removeTx) ? removeTx : [removeTx];
       await Promise.all(txList.map(tx =>
@@ -278,13 +261,8 @@ async function closeAndReopenPosition(poolAddress, positionKey, solAmount) {
       ));
     }
   }
-
-  // Step 2: Open new position at current active bin
   return await openExtremePosition(poolAddress, solAmount);
 }
-
-// ─── Extreme Monitor Loop ─────────────────────────────────────
-
 
 async function closeExtremePositionOnly(poolAddress, positionKey) {
   const wallet = getActiveWallet();
@@ -297,12 +275,9 @@ async function closeExtremePositionOnly(poolAddress, positionKey) {
   const binIds = userPos.positionData.positionBinData.map(b => b.binId);
   if (binIds.length > 0) {
     const removeTx = await dlmmPool.removeLiquidity({
-      position: new PublicKey(positionKey),
-      user: wallet.publicKey,
-      fromBinId: binIds[0],
-      toBinId: binIds[binIds.length - 1],
-      bps: new BN(10000),
-      shouldClaimAndClose: true,
+      position: new PublicKey(positionKey), user: wallet.publicKey,
+      fromBinId: binIds[0], toBinId: binIds[binIds.length - 1],
+      bps: new BN(10000), shouldClaimAndClose: true,
     });
     const txList = Array.isArray(removeTx) ? removeTx : [removeTx];
     return await Promise.all(txList.map(tx =>
@@ -320,13 +295,10 @@ async function closeExtremePositionOnly(poolAddress, positionKey) {
 async function extremeMonitorTick(chatId) {
   const session = extremeSessions[chatId];
   if (!session || session.status === 'stopped') return;
-
   try {
     const { dlmmPool, activeBin } = await getPoolAndActiveBin(session.poolAddress);
     const currentBinId = activeBin.binId;
-
     if (session.status === 'active') {
-      // OOR kanan → close + reopen di bin baru langsung
       if (currentBinId > session.targetBinId) {
         session.cycleCount = (session.cycleCount || 0) + 1;
         session.status = 'executing';
@@ -336,78 +308,50 @@ async function extremeMonitorTick(chatId) {
         const walletR = getActiveWallet();
         const balR = await getSolBalance(walletR.publicKey.toBase58());
         const solR = parseFloat((Math.max(0, balR - 0.08)).toFixed(4));
-        if (solR < 0.01) {
-          session.status = 'stopped';
-          await tgSend(chatId, '⚠️ SOL habis. Extreme mode dihentikan.');
-          return;
-        }
+        if (solR < 0.01) { session.status = 'stopped'; await tgSend(chatId, '⚠️ SOL habis. Extreme mode dihentikan.'); return; }
         const resultR = await openExtremePosition(session.poolAddress, solR);
         session.positionKey = resultR.positionKey;
         session.targetBinId = resultR.targetBinId;
         session.status = 'active';
-        await tgSend(chatId,
-          '✅ Cycle #' + session.cycleCount + ' (kanan) SOL: ' + solR + ' New bin: ' + resultR.targetBinId,
-          { inline_keyboard: [[{ text: '🛑 Stop Extreme', callback_data: 'extreme:stop:' + chatId }]] }
-        );
-      }
-      // OOR kiri → withdraw + readd token ke bin yang sama, tunggu harga balik
-      else if (currentBinId < session.targetBinId) {
+        await tgSend(chatId, '✅ Cycle #' + session.cycleCount + ' (kanan) SOL: ' + solR + ' New bin: ' + resultR.targetBinId,
+          { inline_keyboard: [[{ text: '🛑 Stop Extreme', callback_data: 'extreme:stop:' + chatId }]] });
+      } else if (currentBinId < session.targetBinId) {
         session.status = 'oor';
-        await tgSend(chatId,
-          `⚠️ EXTREME: Out of Range!\n🎯 Target bin: ${session.targetBinId}\n📍 Current bin: ${currentBinId}\n\n⏳ Withdraw & readd token ke bin ${session.targetBinId}...`
-        );
-
+        await tgSend(chatId, `⚠️ EXTREME: Out of Range!\n🎯 Target bin: ${session.targetBinId}\n📍 Current bin: ${currentBinId}\n\n⏳ Withdraw & readd token ke bin ${session.targetBinId}...`);
         const txHash = await withdrawAndReaddToTargetBin(session.poolAddress, session.positionKey, session.targetBinId);
         if (txHash === 'no_token') {
           session.status = 'waiting';
           await tgSend(chatId, `⚠️ Ga ada token setelah withdraw. Menunggu harga balik...`);
         } else {
           session.status = 'waiting';
-          await tgSend(chatId,
-            `✅ Token di-add balik ke bin ${session.targetBinId}\n🔗 Tx: ${txHash}\n\n👀 Menunggu harga naik ke bin ${session.targetBinId}...`
-          );
+          await tgSend(chatId, `✅ Token di-add balik ke bin ${session.targetBinId}\n🔗 Tx: ${txHash}\n\n👀 Menunggu harga naik ke bin ${session.targetBinId}...`);
         }
       }
-
     } else if (session.status === 'executing') {
-      // Skip - currently executing, wait
+      // skip
     } else if (session.status === 'waiting') {
-      // Harga balik ke target bin atau lebih → close + reopen fresh
       if (currentBinId >= session.targetBinId) {
         session.cycleCount = (session.cycleCount || 0) + 1;
         session.status = 'executing';
         await tgSend(chatId, '🎯 Harga balik! Cycle #' + session.cycleCount + ' - Closing posisi...');
-        // Close position
         await closeExtremePositionOnly(session.poolAddress, session.positionKey);
-        // Wait for balance to settle
         await new Promise(r => setTimeout(r, 3000));
-        // Check actual SOL balance
         const wallet2 = getActiveWallet();
         const bal2 = await getSolBalance(wallet2.publicKey.toBase58());
         const solToUse = parseFloat((Math.max(0, bal2 - 0.08)).toFixed(4));
-        if (solToUse < 0.01) {
-          session.status = 'stopped';
-          await tgSend(chatId, '⚠️ SOL habis (' + bal2.toFixed(4) + ' SOL). Extreme mode dihentikan.');
-          return;
-        }
-        // Reopen with actual SOL balance
+        if (solToUse < 0.01) { session.status = 'stopped'; await tgSend(chatId, '⚠️ SOL habis (' + bal2.toFixed(4) + ' SOL). Extreme mode dihentikan.'); return; }
         const result2 = await openExtremePosition(session.poolAddress, solToUse);
         session.positionKey = result2.positionKey;
         session.targetBinId = result2.targetBinId;
         session.status = 'active';
-        await tgSend(chatId,
-          '✅ Cycle #' + session.cycleCount + ' selesai! SOL: ' + solToUse + ' New bin: ' + result2.targetBinId + ' Tx: ' + result2.txHash,
-          { inline_keyboard: [[{ text: '🛑 Stop Extreme', callback_data: 'extreme:stop:' + chatId }]] }
-        );
+        await tgSend(chatId, '✅ Cycle #' + session.cycleCount + ' selesai! SOL: ' + solToUse + ' New bin: ' + result2.targetBinId + ' Tx: ' + result2.txHash,
+          { inline_keyboard: [[{ text: '🛑 Stop Extreme', callback_data: 'extreme:stop:' + chatId }]] });
       }
     }
-
   } catch (e) {
     console.error('[Extreme] Monitor error:', e.message);
     await tgSend(chatId, `⚠️ Extreme monitor error: ${e.message}`).catch(() => {});
   }
-
-  // Schedule next tick
   if (extremeSessions[chatId]?.status !== 'stopped') {
     extremeSessions[chatId].timer = setTimeout(() => extremeMonitorTick(chatId), MONITOR_INTERVAL);
   }
@@ -419,8 +363,6 @@ function stopExtremeSession(chatId) {
   if (session.timer) clearTimeout(session.timer);
   session.status = 'stopped';
 }
-
-// ─── Regular DLMM ─────────────────────────────────────────────
 
 async function addLiquidity(poolAddress, solAmount, rangePercent, strategyStr) {
   const wallet = getActiveWallet();
@@ -438,10 +380,8 @@ async function addLiquidity(poolAddress, solAmount, rangePercent, strategyStr) {
   const maxBinId = activeBin.binId;
   const newPosition = Keypair.generate();
   const createTx = await dlmmPool.initializePositionAndAddLiquidityByStrategy({
-    positionPubKey: newPosition.publicKey,
-    user: wallet.publicKey,
-    totalXAmount: new BN(0),
-    totalYAmount: solToLamports(finalSol),
+    positionPubKey: newPosition.publicKey, user: wallet.publicKey,
+    totalXAmount: new BN(0), totalYAmount: solToLamports(finalSol),
     strategy: { maxBinId, minBinId, strategyType: parseStrategy(strategyStr) },
   });
   const txHash = await sendAndConfirmTransaction(connection, createTx, [wallet, newPosition]);
@@ -523,8 +463,6 @@ async function syncPositions() {
   return { total, added, removed };
 }
 
-// ─── Telegram ─────────────────────────────────────────────────
-
 const chatIds = new Set();
 function fetchJSON(url, options) {
   return new Promise((resolve, reject) => {
@@ -565,16 +503,17 @@ function tgAnswer(callbackQueryId) {
   return tgRequest('answerCallbackQuery', { callback_query_id: callbackQueryId });
 }
 
-// ─── UI ───────────────────────────────────────────────────────
-
 function mainMenu(wallet) {
   const walletLine = wallet
     ? `💼 ${state.wallets[state.activeWalletId]?.name || 'Wallet'}: ${shortKey(wallet.publicKey.toBase58())}`
     : '💼 Belum ada wallet';
   const preset = getActivePreset();
+  const presetLine = preset
+    ? `⚡ Strat: ${preset.name} (${solLabel(preset.sol)} | -${preset.range}% | ${preset.strategy})`
+    : '⚡ Strat: belum ada preset';
   const activeExtreme = Object.values(extremeSessions).find(s => s.status !== 'stopped');
   return {
-    text: `🌊 METEORA DLMM BOT\n━━━━━━━━━━━━━━━━━━━━\n${walletLine}\n⚡ Strat: ${preset.name} (${solLabel(preset.sol)} | -${preset.range}% | ${preset.strategy})\n${activeExtreme ? '🔴 EXTREME MODE AKTIF\n' : ''}━━━━━━━━━━━━━━━━━━━━\n\nPilih menu:`,
+    text: `🌊 METEORA DLMM BOT\n━━━━━━━━━━━━━━━━━━━━\n${walletLine}\n${presetLine}\n${activeExtreme ? '🔴 EXTREME MODE AKTIF\n' : ''}━━━━━━━━━━━━━━━━━━━━\n\nPilih menu:`,
     markup: {
       inline_keyboard: [
         [{ text: '➕ Add LP', callback_data: 'menu:addlp' }, { text: '📊 Posisi', callback_data: 'menu:positions' }],
@@ -594,10 +533,7 @@ function walletMenu() {
   }]);
   buttons.push([{ text: '➕ Import Wallet Baru', callback_data: 'wallet:import' }]);
   buttons.push([{ text: '🔙 Back', callback_data: 'menu:main' }]);
-  return {
-    text: '💼 WALLET MANAGER\n━━━━━━━━━━━━━━━━━━━━\n\nPilih wallet aktif atau import baru:',
-    markup: { inline_keyboard: buttons }
-  };
+  return { text: '💼 WALLET MANAGER\n━━━━━━━━━━━━━━━━━━━━\n\nPilih wallet aktif atau import baru:', markup: { inline_keyboard: buttons } };
 }
 
 function stratMenu() {
@@ -640,19 +576,13 @@ async function handleTgMessage(chatId, text) {
     await tgSend(chatId, `💥 Starting Extreme Mode...\n🏊 Pool: ${shortKey(poolAddress)}\n💰 ${solAmount === 'max' ? '99% balance' : solAmount + ' SOL'}\n🎯 1 bin | BidAsk | 2.5s monitor`);
     try {
       const result = await openExtremePosition(poolAddress, solAmount);
-      extremeSessions[chatId] = {
-        chatId, poolAddress, positionKey: result.positionKey,
-        targetBinId: result.targetBinId, solAmount,
-        status: 'active', cycleCount: 0,
-      };
+      extremeSessions[chatId] = { chatId, poolAddress, positionKey: result.positionKey, targetBinId: result.targetBinId, solAmount, status: 'active', cycleCount: 0 };
       extremeSessions[chatId].timer = setTimeout(() => extremeMonitorTick(chatId), MONITOR_INTERVAL);
       return tgSend(chatId,
         `✅ EXTREME MODE AKTIF!\n━━━━━━━━━━━━━━━━━━━━\n📍 Position: ${shortKey(result.positionKey)}\n🎯 Target bin: ${result.targetBinId}\n💰 SOL: ${result.solUsed}\n🔗 Tx: ${result.txHash}\n\nBot monitor tiap 2.5 detik. Klik stop kalau mau berhenti.`,
         { inline_keyboard: [[{ text: '🛑 Stop Extreme', callback_data: `extreme:stop:${chatId}` }]] }
       );
-    } catch (e) {
-      return tgSend(chatId, `❌ Error: ${e.message}`);
-    }
+    } catch (e) { return tgSend(chatId, `❌ Error: ${e.message}`); }
   }
 
   if (us?.step === 'strat_name') {
@@ -705,9 +635,7 @@ async function handleTgMessage(chatId, text) {
       const result = addWallet(name, text.trim());
       return tgSend(chatId, `✅ Wallet "${name}" berhasil diimport!\nAddress: ${shortKey(result.pubkey)}\n\n⚠️ Segera hapus pesan PK kamu!`,
         { inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'menu:main' }]] });
-    } catch (e) {
-      return tgSend(chatId, `❌ Private key tidak valid: ${e.message}`);
-    }
+    } catch (e) { return tgSend(chatId, `❌ Private key tidak valid: ${e.message}`); }
   }
 
   if (isPoolInput(text)) {
@@ -723,9 +651,7 @@ async function handleTgMessage(chatId, text) {
       return tgSend(chatId,
         `✅ LP Added!\n━━━━━━━━━━━━━━━━━━━━\n📍 Position: ${shortKey(result.positionKey)}\n💰 SOL Used: ${result.solUsed}\n📊 Bins: ${result.minBinId} - ${result.maxBinId}\n🔗 Tx: ${result.txHash}`,
         card.markup);
-    } catch (e) {
-      return tgSend(chatId, `❌ Error: ${e.message}`);
-    }
+    } catch (e) { return tgSend(chatId, `❌ Error: ${e.message}`); }
   }
 
   if (text.startsWith('/start') || text.startsWith('/help')) {
@@ -744,10 +670,7 @@ async function handleCallback(callbackQuery) {
   const ns = parts[0], action = parts[1], param = parts.slice(2).join(':');
 
   try {
-    if (data === 'menu:main') {
-      const menu = mainMenu(getActiveWallet());
-      return tgEdit(chatId, msgId, menu.text, menu.markup);
-    }
+    if (data === 'menu:main') { const menu = mainMenu(getActiveWallet()); return tgEdit(chatId, msgId, menu.text, menu.markup); }
     if (data === 'menu:balance') {
       const wallet = getActiveWallet();
       if (!wallet) return tgEdit(chatId, msgId, '❌ Belum ada wallet aktif.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:main' }]] });
@@ -784,42 +707,25 @@ async function handleCallback(callbackQuery) {
     if (data === 'menu:positions') {
       const positions = Object.entries(state.positions);
       if (positions.length === 0) {
-        return tgEdit(chatId, msgId, '📊 POSISI\n━━━━━━━━━━━━━━━━━━━━\n\n📭 Tidak ada posisi aktif.',
-          { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:main' }]] });
+        return tgEdit(chatId, msgId, '📊 POSISI\n━━━━━━━━━━━━━━━━━━━━\n\n📭 Tidak ada posisi aktif.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:main' }]] });
       }
-      const buttons = positions.map(([key, pos]) => [{
-        text: `🏊 ${shortKey(pos.poolAddress)} — ${pos.solAmount > 0 ? pos.solAmount + ' SOL' : 'synced'}`,
-        callback_data: `pos:view:${key}`
-      }]);
+      const buttons = positions.map(([key, pos]) => [{ text: `🏊 ${shortKey(pos.poolAddress)} — ${pos.solAmount > 0 ? pos.solAmount + ' SOL' : 'synced'}`, callback_data: `pos:view:${key}` }]);
       buttons.push([{ text: '🔙 Back', callback_data: 'menu:main' }]);
       return tgEdit(chatId, msgId, `📊 POSISI AKTIF\n━━━━━━━━━━━━━━━━━━━━\n\n${positions.length} posisi:`, { inline_keyboard: buttons });
     }
-    if (data === 'menu:wallet') {
-      const wMenu = walletMenu();
-      return tgEdit(chatId, msgId, wMenu.text, wMenu.markup);
-    }
-    if (data === 'menu:strat') {
-      const sm = stratMenu();
-      return tgEdit(chatId, msgId, sm.text, sm.markup);
-    }
+    if (data === 'menu:wallet') { const wMenu = walletMenu(); return tgEdit(chatId, msgId, wMenu.text, wMenu.markup); }
+    if (data === 'menu:strat') { const sm = stratMenu(); return tgEdit(chatId, msgId, sm.text, sm.markup); }
     if (data === 'menu:extreme') {
       const preset = getActivePreset();
       return tgEdit(chatId, msgId,
         `💥 EXTREME MODE\n━━━━━━━━━━━━━━━━━━━━\n\n🎯 1 bin | BidAsk | Auto-rebalance\n⏱️ Monitor: 2.5 detik\n💰 SOL: ${solLabel(preset.sol)}\n\n⚠️ Mode ini agresif! Bot akan terus rebalance selama aktif.\n\nPaste link pool untuk mulai:`,
-        { inline_keyboard: [
-          [{ text: `💰 Pakai ${solLabel(preset.sol)} (preset aktif)`, callback_data: `extreme:start:${preset.sol === 'max' ? 'max' : preset.sol}` }],
-          [{ text: '🔙 Back', callback_data: 'menu:main' }]
-        ]}
+        { inline_keyboard: [[{ text: `💰 Pakai ${solLabel(preset.sol)} (preset aktif)`, callback_data: `extreme:start:${preset.sol === 'max' ? 'max' : preset.sol}` }], [{ text: '🔙 Back', callback_data: 'menu:main' }]] }
       );
     }
 
-    // Extreme actions
     if (ns === 'extreme' && action === 'start') {
       userState[chatId] = { step: 'extreme_pool', data: { solAmount: param === 'max' ? 'max' : parseFloat(param) } };
-      return tgEdit(chatId, msgId,
-        `💥 EXTREME MODE\n━━━━━━━━━━━━━━━━━━━━\n\nPaste link pool Meteora:`,
-        { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:main' }]] }
-      );
+      return tgEdit(chatId, msgId, `💥 EXTREME MODE\n━━━━━━━━━━━━━━━━━━━━\n\nPaste link pool Meteora:`, { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:main' }]] });
     }
     if (ns === 'extreme' && action === 'stop') {
       const targetChatId = parseInt(param);
@@ -830,68 +736,27 @@ async function handleCallback(callbackQuery) {
       );
     }
 
-    // Strat actions
-    if (ns === 'strat' && action === 'switch') {
-      switchPreset(param);
-      const p = state.presets[param];
-      const sm = stratMenu();
-      return tgEdit(chatId, msgId, `✅ Strat aktif: ${p.name}\n💰 ${solLabel(p.sol)} | -${p.range}% | ${p.strategy}\n\n` + sm.text, sm.markup);
-    }
-    if (ns === 'strat' && action === 'add') {
-      userState[chatId] = { step: 'strat_name' };
-      return tgEdit(chatId, msgId,
-        '➕ TAMBAH STRAT\n━━━━━━━━━━━━━━━━━━━━\n\nKetik 1 atau beberapa strat (1 per baris):\n<nama> <sol|max> <range%> <spot|curve|bidask>\n\nContoh:\nSETORAN max 7 bidask\nSAFE 1 30 spot',
-        { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:strat' }]] });
-    }
+    if (ns === 'strat' && action === 'switch') { switchPreset(param); const p = state.presets[param]; const sm = stratMenu(); return tgEdit(chatId, msgId, `✅ Strat aktif: ${p.name}\n💰 ${solLabel(p.sol)} | -${p.range}% | ${p.strategy}\n\n` + sm.text, sm.markup); }
+    if (ns === 'strat' && action === 'add') { userState[chatId] = { step: 'strat_name' }; return tgEdit(chatId, msgId, '➕ TAMBAH STRAT\n━━━━━━━━━━━━━━━━━━━━\n\nKetik 1 atau beberapa strat (1 per baris):\n<nama> <sol|max> <range%> <spot|curve|bidask>\n\nContoh:\nSETORAN max 7 bidask\nSAFE 1 30 spot', { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:strat' }]] }); }
     if (ns === 'strat' && action === 'edit_list') {
       const presets = Object.values(state.presets);
-      const buttons = presets.map(p => [{
-        text: `✏️ ${p.name} (${p.sol === 'max' ? 'MAX' : p.sol + ' SOL'} | -${p.range}% | ${p.strategy})`,
-        callback_data: `strat:edit:${p.name}`
-      }]);
+      const buttons = presets.map(p => [{ text: `✏️ ${p.name} (${p.sol === 'max' ? 'MAX' : p.sol + ' SOL'} | -${p.range}% | ${p.strategy})`, callback_data: `strat:edit:${p.name}` }]);
       buttons.push([{ text: '🔙 Back', callback_data: 'menu:strat' }]);
       return tgEdit(chatId, msgId, '✏️ EDIT STRAT\n━━━━━━━━━━━━━━━━━━━━\n\nPilih strat yang mau diedit:', { inline_keyboard: buttons });
     }
-    if (ns === 'strat' && action === 'edit') {
-      userState[chatId] = { step: 'strat_edit', data: { id: param } };
-      const p = state.presets[param];
-      return tgEdit(chatId, msgId,
-        `✏️ Edit strat "${param}"\nSekarang: ${solLabel(p.sol)} | -${p.range}% | ${p.strategy}\n\nKetik nilai baru:\n<sol|max> <range%> <spot|curve|bidask>`,
-        { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'strat:edit_list' }]] });
-    }
+    if (ns === 'strat' && action === 'edit') { userState[chatId] = { step: 'strat_edit', data: { id: param } }; const p = state.presets[param]; return tgEdit(chatId, msgId, `✏️ Edit strat "${param}"\nSekarang: ${solLabel(p.sol)} | -${p.range}% | ${p.strategy}\n\nKetik nilai baru:\n<sol|max> <range%> <spot|curve|bidask>`, { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'strat:edit_list' }]] }); }
     if (ns === 'strat' && action === 'delete_list') {
-      const presets = Object.values(state.presets).filter(p => p.name !== 'sannastrat');
-      if (presets.length === 0) {
-        return tgEdit(chatId, msgId, '❌ Tidak ada strat yang bisa dihapus.',
-          { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:strat' }]] });
-      }
-      const buttons = presets.map(p => [{
-        text: `🗑️ ${p.name} (${p.sol === 'max' ? 'MAX' : p.sol + ' SOL'} | -${p.range}% | ${p.strategy})`,
-        callback_data: `strat:delete:${p.name}`
-      }]);
+      const presets = Object.values(state.presets);
+      if (presets.length === 0) return tgEdit(chatId, msgId, '❌ Tidak ada strat yang bisa dihapus.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:strat' }]] });
+      const buttons = presets.map(p => [{ text: `🗑️ ${p.name} (${p.sol === 'max' ? 'MAX' : p.sol + ' SOL'} | -${p.range}% | ${p.strategy})`, callback_data: `strat:delete:${p.name}` }]);
       buttons.push([{ text: '🔙 Back', callback_data: 'menu:strat' }]);
       return tgEdit(chatId, msgId, '🗑️ HAPUS STRAT\n━━━━━━━━━━━━━━━━━━━━\n\nPilih strat yang mau dihapus:', { inline_keyboard: buttons });
     }
-    if (ns === 'strat' && action === 'delete') {
-      deletePreset(param);
-      const sm = stratMenu();
-      return tgEdit(chatId, msgId, `✅ Strat "${param}" dihapus.\n\n` + sm.text, sm.markup);
-    }
+    if (ns === 'strat' && action === 'delete') { deletePreset(param); const sm = stratMenu(); return tgEdit(chatId, msgId, `✅ Strat "${param}" dihapus.\n\n` + sm.text, sm.markup); }
 
-    // Wallet actions
-    if (ns === 'wallet' && action === 'import') {
-      userState[chatId] = { step: 'import_name' };
-      return tgEdit(chatId, msgId,
-        '💼 IMPORT WALLET\n━━━━━━━━━━━━━━━━━━━━\n\nKetik nama untuk wallet ini:',
-        { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:wallet' }]] });
-    }
-    if (ns === 'wallet' && action === 'switch') {
-      switchWallet(param);
-      const wMenu = walletMenu();
-      return tgEdit(chatId, msgId, `✅ Wallet aktif: ${state.wallets[param]?.name}\n\n` + wMenu.text, wMenu.markup);
-    }
+    if (ns === 'wallet' && action === 'import') { userState[chatId] = { step: 'import_name' }; return tgEdit(chatId, msgId, '💼 IMPORT WALLET\n━━━━━━━━━━━━━━━━━━━━\n\nKetik nama untuk wallet ini:', { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:wallet' }]] }); }
+    if (ns === 'wallet' && action === 'switch') { switchWallet(param); const wMenu = walletMenu(); return tgEdit(chatId, msgId, `✅ Wallet aktif: ${state.wallets[param]?.name}\n\n` + wMenu.text, wMenu.markup); }
 
-    // Position actions
     if (ns === 'pos' && (action === 'view' || action === 'status')) {
       const posData = state.positions[param];
       if (!posData) return tgEdit(chatId, msgId, '❌ Position tidak ditemukan.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:positions' }]] });
@@ -902,11 +767,8 @@ async function handleCallback(callbackQuery) {
     if (ns === 'pos' && action === 'remove') {
       await tgEdit(chatId, msgId, `⏳ Removing LP...\n📍 ${shortKey(param)}`);
       const txHashes = await removeLiquidity(param);
-      return tgEdit(chatId, msgId,
-        `✅ LP Removed!\n━━━━━━━━━━━━━━━━━━━━\n🔗 Tx: ${txHashes[0]}`,
-        { inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'menu:main' }]] });
+      return tgEdit(chatId, msgId, `✅ LP Removed!\n━━━━━━━━━━━━━━━━━━━━\n🔗 Tx: ${txHashes[0]}`, { inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'menu:main' }]] });
     }
-
   } catch (e) {
     console.error('[Callback] Error:', e.message);
     tgEdit(chatId, msgId, `❌ Error: ${e.message}`, { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:main' }]] }).catch(() => {});
@@ -920,12 +782,8 @@ async function tgPoll() {
     if (data.ok && data.result.length > 0) {
       for (const update of data.result) {
         tgOffset = update.update_id + 1;
-        if (update.message?.text) {
-          handleTgMessage(update.message.chat.id, update.message.text).catch(e => console.error('[TG]', e.message));
-        }
-        if (update.callback_query) {
-          handleCallback(update.callback_query).catch(e => console.error('[Callback]', e.message));
-        }
+        if (update.message?.text) handleTgMessage(update.message.chat.id, update.message.text).catch(e => console.error('[TG]', e.message));
+        if (update.callback_query) handleCallback(update.callback_query).catch(e => console.error('[Callback]', e.message));
       }
     }
   } catch (e) { console.error('[TG] Poll error:', e.message); }
@@ -933,10 +791,33 @@ async function tgPoll() {
 }
 
 async function start() {
-  if (Object.keys(state.wallets).length === 0 && process.env.WALLET_PRIVATE_KEY) {
-    console.log('[Wallet] Loading wallet from env...');
-    addWallet('Default', process.env.WALLET_PRIVATE_KEY);
+  if (!TELEGRAM_TOKEN) {
+    console.error('❌ TELEGRAM_TOKEN tidak ditemukan di .env! Pastikan file .env ada dan berisi TELEGRAM_TOKEN=...');
+    process.exit(1);
   }
+
+  // Auto-load wallets from env (WALLET_1, WALLET_2, etc) if not already in state
+  let i = 1;
+  while (process.env[`WALLET_${i}`]) {
+    const envKey = `WALLET_${i}`;
+    const pk = process.env[envKey];
+    // Check if this envKey is already tracked
+    const alreadyTracked = Object.values(state.wallets).some(w => w.envKey === envKey);
+    if (!alreadyTracked) {
+      try {
+        const kp = Keypair.fromSecretKey(bs58.default.decode(pk));
+        const id = kp.publicKey.toBase58().slice(0, 8);
+        state.wallets[id] = { id, name: `Wallet ${i}`, pubkey: kp.publicKey.toBase58(), envKey };
+        if (!state.activeWalletId) state.activeWalletId = id;
+        console.log(`[Wallet] Loaded ${envKey}: ${kp.publicKey.toBase58()}`);
+      } catch (e) {
+        console.error(`[Wallet] Gagal load ${envKey}: ${e.message}`);
+      }
+    }
+    i++;
+  }
+  saveData();
+
   console.log('🌐 Finding best RPC...');
   connection = new Connection(await getBestRpc(), 'confirmed');
   const wallet = getActiveWallet();
